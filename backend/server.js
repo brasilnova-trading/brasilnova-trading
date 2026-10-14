@@ -272,6 +272,122 @@ app.post("/api/mining/complete", authenticate, async (req, res) => {
   }
 });
 
+
+// Protected administrator API. Configure ADMIN_UID in Render.
+async function requireAdmin(req, res, next) {
+  const adminUid = String(process.env.ADMIN_UID || "").trim();
+  if (!adminUid) {
+    return res.status(503).json({ error: "Admin access is not configured on the server." });
+  }
+  if (req.uid !== adminUid) {
+    return res.status(403).json({ error: "Administrator access required." });
+  }
+  next();
+}
+
+app.get("/api/admin/me", authenticate, requireAdmin, (req, res) => {
+  res.json({ isAdmin: true });
+});
+
+app.get("/api/admin/overview", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const [usersSnap, depositsSnap, withdrawalsSnap] = await Promise.all([
+      db.collection("users").limit(500).get(),
+      db.collection("depositRequests").limit(300).get(),
+      db.collection("withdrawalRequests").limit(300).get()
+    ]);
+
+    const pending = snap => snap.docs.filter(d => d.data().status === "pending");
+    const userBalances = usersSnap.docs.reduce(
+      (sum, d) => sum + Math.max(0, Number(d.data().balance || 0)), 0
+    );
+
+    res.json({
+      totalUsers: usersSnap.size,
+      recordedBalances: userBalances,
+      pendingDeposits: pending(depositsSnap).length,
+      pendingWithdrawals: pending(withdrawalsSnap).length,
+      users: usersSnap.docs.map(d => {
+        const u = d.data();
+        return {
+          uid: d.id,
+          fullName: String(u.fullName || ""),
+          email: String(u.email || ""),
+          balance: Number(u.balance || 0),
+          status: String(u.status || "unknown"),
+          createdAt: u.createdAt?.toDate ? u.createdAt.toDate().toISOString() : null
+        };
+      }).sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || "")),
+      requests: [
+        ...depositsSnap.docs.map(d => ({ id: d.id, type: "deposit", ...d.data() })),
+        ...withdrawalsSnap.docs.map(d => ({ id: d.id, type: "withdrawal", ...d.data() }))
+      ].map(r => ({
+        id: r.id,
+        type: r.type,
+        userId: String(r.userId || ""),
+        userEmail: String(r.userEmail || ""),
+        amount: Number(r.amount || 0),
+        status: String(r.status || "unknown"),
+        reference: String(r.reference || ""),
+        createdAt: r.createdAt?.toDate ? r.createdAt.toDate().toISOString() : null
+      })).sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""))
+    });
+  } catch (err) {
+    console.error("Admin overview failed:", err);
+    res.status(500).json({ error: "Could not load administrator data." });
+  }
+});
+
+// Review is a record-keeping action only. It does not transfer money or
+// change user balances. Verify payment independently before marking verified.
+app.post("/api/admin/requests/:type/:id/review", authenticate, requireAdmin, async (req, res) => {
+  const { type, id } = req.params;
+  const { status, note = "" } = req.body || {};
+
+  if (!["deposit", "withdrawal"].includes(type) ||
+      !["verified", "rejected"].includes(status) ||
+      typeof note !== "string" || note.length > 500 ||
+      !/^[A-Za-z0-9_-]{1,150}$/.test(id)) {
+    return res.status(400).json({ error: "Invalid review details." });
+  }
+
+  const collectionName = type === "deposit" ? "depositRequests" : "withdrawalRequests";
+  const requestRef = db.collection(collectionName).doc(id);
+  const auditRef = db.collection("adminAuditLogs").doc();
+
+  try {
+    await db.runTransaction(async tx => {
+      const snap = await tx.get(requestRef);
+      if (!snap.exists) throw new Error("REQUEST_NOT_FOUND");
+      if (snap.data().status !== "pending") throw new Error("REQUEST_ALREADY_REVIEWED");
+
+      tx.update(requestRef, {
+        status,
+        adminNote: note.trim(),
+        reviewedBy: req.uid,
+        reviewedAt: new Date()
+      });
+      tx.create(auditRef, {
+        action: "request_review",
+        requestType: type,
+        requestId: id,
+        result: status,
+        note: note.trim(),
+        adminUid: req.uid,
+        createdAt: new Date()
+      });
+    });
+
+    res.json({ success: true, status, message: "Request review recorded. No funds were transferred." });
+  } catch (err) {
+    if (err.message === "REQUEST_NOT_FOUND") return res.status(404).json({ error: "Request not found." });
+    if (err.message === "REQUEST_ALREADY_REVIEWED") return res.status(409).json({ error: "This request has already been reviewed." });
+    console.error("Admin review failed:", err);
+    res.status(500).json({ error: "Could not record request review." });
+  }
+});
+
+
 const port = Number(process.env.PORT || 3001);
 
 app.listen(port, "0.0.0.0", () => {

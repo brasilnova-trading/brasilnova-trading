@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, {useEffect, useMemo, useState, useRef} from "react";
 import {
   Activity, ArrowDownLeft, ArrowUpRight, BarChart3, Bell, Bitcoin, CheckCircle2,
   ChevronDown, CircleHelp, Clock3, Cpu, Gauge, LayoutDashboard, LogOut, Menu,
@@ -12,6 +12,7 @@ import {
   addDoc, collection, doc, onSnapshot, query, serverTimestamp, setDoc, where, runTransaction} from "firebase/firestore";
 import { auth, db, firebaseConfigured } from "./firebase";
 
+import AdminPanel from "./AdminPanel";
 const SUPPORT = import.meta.env.VITE_SUPPORT_EMAIL || "brasilnovatradingadministrator@gmail.com";
 const money = (n) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(Number(n || 0));
 const dateText = (v) => {
@@ -21,7 +22,7 @@ const dateText = (v) => {
 const navItems = [
   ["dashboard", "Visão geral", LayoutDashboard], ["mining", "Centro de mineração", Pickaxe],
   ["wallet", "Carteira", Wallet], ["activity", "Atividade", Activity], ["help", "Ajuda", CircleHelp]
-];
+ ["admin", "Administração", ShieldCheck],];
 
 const miningPlans = [
   { deposit: 150, target: 5500 }, { deposit: 300, target: 11000 }, { deposit: 450, target: 16500 },
@@ -54,7 +55,7 @@ function AuthScreen() {
   return <div className="auth-wrap">
     <div className="auth-art"><div className="brand large"><span className="brand-mark">BN</span><span>BrasilNova <b>Trading</b></span></div>
       <div className="art-copy"><span className="eyebrow"><Sparkles size={14}/> SUA CENTRAL FINANCEIRA</span><h1>Tenha clareza sobre cada movimento.</h1><p>Acompanhe sua conta, solicitações e uma experiência demonstrativa de mineração em um só lugar.</p></div>
-      <div className="art-orbit orbit-one"></div><div className="art-orbit orbit-two"></div><div className="art-bottom"><ShieldCheck size={16}/> Conta protegida por autenticação Firebase</div>
+      <div className="art-orbit orbit-one"></div><div className="art-orbit orbit-two"></div><div className="art-bottom"><ShieldCheck size={16}/> Conta protegida </div>
     </div>
     <form className="auth-card" onSubmit={submit}>
       <span className="eyebrow">BEM-VINDO À BRASILNOVA</span><h2>{mode === "login" ? "Entre na sua conta" : "Crie sua conta"}</h2><p className="muted">Use seus dados para continuar.</p>
@@ -70,6 +71,7 @@ function AuthScreen() {
 }
 
 function App() {
+  const completionInFlight = useRef(false);
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [profile, setProfile] = useState(null);
@@ -146,13 +148,13 @@ function App() {
   const timeLabel = miningComplete ? "24:00:00" : `${String(Math.floor(timeLeftSeconds / 3600)).padStart(2,"0")}:${String(Math.floor((timeLeftSeconds % 3600) / 60)).padStart(2,"0")}:${String(timeLeftSeconds % 60).padStart(2,"0")}`;
 
   async function startMiningSession(reinvest = false) {
-    if (!user || !db) {
+    if (!user) {
       setNotice("Entre na sua conta primeiro.");
       return;
     }
 
     const plan = reinvest && miningSession
-      ? miningPlans.find(item => item.deposit === Number(miningSession.depositAmount))
+      ? miningPlans.find(item => Number(item.deposit) === Number(miningSession.depositAmount))
       : miningPlans.find(item => String(item.deposit) === String(miningPlan));
 
     if (!plan) {
@@ -169,71 +171,86 @@ function App() {
     setNotice("");
 
     try {
-      const userRef = doc(db, "users", user.uid);
-      const now = Date.now();
-
-      const nextSession = {
-        status: "active",
-        depositAmount: plan.deposit,
-        targetAmount: plan.target,
-        startedAt: now,
-        durationMs: MINING_DURATION,
-        credited: false,
-        reference: `MIN-${now.toString(36).toUpperCase()}`
-      };
-
-      await runTransaction(db, async (transaction) => {
-        const snapshot = await transaction.get(userRef);
-        const data = snapshot.exists() ? snapshot.data() : {};
-        const currentBalance = Number(data.balance || 0);
-        const currentSession = data.miningSession;
-
-        if (!Number.isFinite(currentBalance) || currentBalance < plan.deposit) {
-          throw new Error("SALDO_INSUFICIENTE");
+      const token = await user.getIdToken();
+      const response = await fetch(
+        "https://brasilnova-trading.onrender.com/api/mining/start",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${token}`
+          },
+          body: JSON.stringify({ deposit: Number(plan.deposit) })
         }
+      );
 
-        if (currentSession?.status === "active") {
-          const startedAt = Number(currentSession.startedAt || 0);
-          const elapsed = Date.now() - startedAt;
-          const stillRunning = startedAt > 0 && elapsed < MINING_DURATION;
+      const result = await response.json().catch(() => ({}));
 
-          if (stillRunning) {
-            throw new Error("SESSAO_JA_ATIVA");
-          }
-        }
+      if (!response.ok) {
+        throw new Error(result.error || `Backend error (${response.status})`);
+      }
 
-        transaction.set(userRef, {
-          balance: currentBalance - plan.deposit,
-          miningSession: nextSession
-        }, { merge: true });
-      });
+      if (!result.success || !result.miningSession) {
+        throw new Error("O servidor não confirmou a sessão.");
+      }
 
       setMiningPlan(String(plan.deposit));
-      setMiningSession(nextSession);
-      setNotice("Sessão iniciada. O depósito foi deduzido do saldo disponível.");
+      setMiningSession(result.miningSession);
+      setNotice(result.message || "Sessão iniciada e confirmada pelo servidor.");
     } catch (err) {
       console.error("Start mining failed:", err);
-
-      if (err.message === "SALDO_INSUFICIENTE") {
-        setNotice("Saldo insuficiente para este plano. Adicione fundos antes de iniciar.");
-      } else if (err.message === "SESSAO_JA_ATIVA") {
-        setNotice("Você já tem uma sessão ativa. Não foi feita outra dedução.");
-      } else {
-        setNotice("Não foi possível iniciar a sessão: " + (err.code || err.message || "erro desconhecido"));
-      }
+      setNotice("Não foi possível iniciar: " + (err.message || "erro desconhecido"));
     } finally {
       setBusy(false);
     }
   }
 
   async function completeMiningSession() {
-    if (!user || !db || !miningSession || !miningComplete) return;
+    if (!user || !miningSession || miningSession.status !== "active" || !miningComplete) return;
+    if (completionInFlight.current) return;
+    completionInFlight.current = true;
+
+    setBusy(true);
     try {
-      const completed = { ...miningSession, status: "completed", completedAt: Date.now(), credited: false };
-      await setDoc(doc(db, "users", user.uid), { miningSession: completed }, { merge: true });
-      setMiningSession(completed);
-      setNotice("Sessão concluída. O valor alvo está aguardando verificação antes de qualquer crédito ao saldo disponível.");
-    } catch (err) { console.error(err); setNotice("Não foi possível salvar a conclusão. Tente novamente."); }
+      const token = await user.getIdToken();
+      const response = await fetch(
+        "https://brasilnova-trading.onrender.com/api/mining/complete",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${token}`
+          },
+          body: JSON.stringify({})
+        }
+      );
+
+      const result = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(result.error || `Backend error (${response.status})`);
+      }
+
+      if (!result.success || !result.miningSession) {
+        throw new Error("O servidor não confirmou a conclusão.");
+      }
+
+      setMiningSession(result.miningSession);
+      setNotice(
+        result.message ||
+        "Sessão concluída. O servidor confirmou a atualização da carteira."
+      );
+    } catch (err) {
+      console.error("Complete mining failed:", err);
+      setNotice(
+        "A conclusão ainda não foi confirmada pelo servidor: " +
+        (err.message || "erro desconhecido") +
+        ". Não tente iniciar outra sessão; atualize a página e tente novamente."
+      );
+    } finally {
+      completionInFlight.current = false;
+      setBusy(false);
+    }
   }
 
   useEffect(() => {
@@ -325,11 +342,12 @@ function App() {
           {miningComplete ? <div className="two-col"><div className="card form-card"><div className="card-title"><div className="mini-icon green"><RefreshCw size={18}/></div><div><h3>Reinvestir</h3><p>Iniciar uma nova sessão de 24 horas.</p></div></div><button className="btn primary full" disabled={busy} onClick={()=>startMiningSession(true)}>Reinvestir / nova sessão</button></div><div className="card form-card"><div className="card-title"><div className="mini-icon purple"><Wallet size={18}/></div><div><h3>Retirar fundos</h3><p>Verifique o saldo disponível antes de solicitar.</p></div></div><button className="btn dark full" onClick={()=>setPage("wallet")}>Ir para saques</button></div></div> : <div className="card warning-card"><div className="warning-icon"><ShieldCheck size={20}/></div><div><strong>Sessão salva</strong><p>Atualizar a página não reinicia a contagem. O saldo disponível só deve ser alterado após confirmação segura de valores realmente recebidos.</p></div></div>}
           </>}
         </section>}
-        {page==="wallet" && <section><div className="page-heading"><div><span className="eyebrow">GESTÃO FINANCEIRA</span><h1>Carteira</h1><p>Consulte seu saldo registrado e envie solicitações.</p></div></div><div className="wallet-hero"><div><span className="subtle">SALDO REGISTRADO</span><h2>{money(balance)}</h2><span className="balance-note"><ShieldCheck size={14}/> Saldo carregado do perfil Firestore</span></div><div className="wallet-hero-icon"><Wallet size={34}/></div></div><div className="two-col"><div className="card form-card"><div className="card-title"><div className="mini-icon green"><ArrowDownLeft size={18}/></div><div><h3>Solicitar depósito</h3><p>O pedido ficará pendente para revisão.</p></div></div><label>Valor em BRL<input type="number" min="1" max="1000000" step="0.01" placeholder="Ex.: 250,00" value={depositAmount} onChange={e=>setDepositAmount(e.target.value)}/></label><button className="btn primary full" disabled={busy} onClick={()=>requestMoney("deposit")}>{busy?"Enviando...":"Solicitar depósito"} <ArrowDownLeft size={17}/></button><small>O pedido não adiciona saldo automaticamente. O pagamento deve ser confirmado por um processo seguro.</small></div><div className="card form-card"><div className="card-title"><div className="mini-icon purple"><ArrowUpRight size={18}/></div><div><h3>Solicitar saque</h3><p>Informe o valor e o destino do pagamento.</p></div></div><label>Valor em BRL<input type="number" min="1" max="1000000" step="0.01" placeholder="Ex.: 100,00" value={withdrawAmount} onChange={e=>setWithdrawAmount(e.target.value)}/></label><label>Nome completo do titular<input value={recipientName} onChange={e=>setRecipientName(e.target.value)} placeholder="Nome como aparece na conta" autoComplete="name"/></label><label>Nome do banco<input value={bankName} onChange={e=>setBankName(e.target.value)} placeholder="Ex.: banco ou instituição"/></label><label>Número da conta<input value={accountNumber} onChange={e=>setAccountNumber(e.target.value)} placeholder="Número da conta" inputMode="numeric" autoComplete="off"/></label><label>Chave PIX<input value={withdrawKey} onChange={e=>setWithdrawKey(e.target.value)} placeholder="Informe sua chave PIX" autoComplete="off"/></label><button className="btn dark full" disabled={busy} onClick={()=>requestMoney("withdraw")}>{busy?"Enviando...":"Solicitar saque"} <ArrowUpRight size={17}/></button><small>Solicitações de saque ficam pendentes. Não há transferência automática neste protótipo.</small></div></div><RequestsCard requests={allRequests}/></section>}
+        {page==="wallet" && <section><div className="page-heading"><div><span className="eyebrow">GESTÃO FINANCEIRA</span><h1>Carteira</h1><p>Consulte seu saldo registrado e envie solicitações.</p></div></div><div className="wallet-hero"><div><span className="subtle">SALDO REGISTRADO</span><h2>{money(balance)}</h2><span className="balance-note"><ShieldCheck size={14}/> Saldo carregado </span></div><div className="wallet-hero-icon"><Wallet size={34}/></div></div><div className="two-col"><div className="card form-card"><div className="card-title"><div className="mini-icon green"><ArrowDownLeft size={18}/></div><div><h3>Solicitar depósito</h3><p>O pedido ficará pendente para revisão.</p></div></div><label>Valor em BRL<input type="number" min="1" max="1000000" step="0.01" placeholder="Ex.: 250,00" value={depositAmount} onChange={e=>setDepositAmount(e.target.value)}/></label><button className="btn primary full" disabled={busy} onClick={()=>requestMoney("deposit")}>{busy?"Enviando...":"Solicitar depósito"} <ArrowDownLeft size={17}/></button><small>O pedido não adiciona saldo automaticamente. O pagamento deve ser confirmado por um processo seguro.</small></div><div className="card form-card"><div className="card-title"><div className="mini-icon purple"><ArrowUpRight size={18}/></div><div><h3>Solicitar saque</h3><p>Informe o valor e o destino do pagamento.</p></div></div><label>Valor em BRL<input type="number" min="1" max="1000000" step="0.01" placeholder="Ex.: 100,00" value={withdrawAmount} onChange={e=>setWithdrawAmount(e.target.value)}/></label><label>Nome completo do titular<input value={recipientName} onChange={e=>setRecipientName(e.target.value)} placeholder="Nome como aparece na conta" autoComplete="name"/></label><label>Nome do banco<input value={bankName} onChange={e=>setBankName(e.target.value)} placeholder="Ex.: banco ou instituição"/></label><label>Número da conta<input value={accountNumber} onChange={e=>setAccountNumber(e.target.value)} placeholder="Número da conta" inputMode="numeric" autoComplete="off"/></label><label>Chave PIX<input value={withdrawKey} onChange={e=>setWithdrawKey(e.target.value)} placeholder="Informe sua chave PIX" autoComplete="off"/></label><button className="btn dark full" disabled={busy} onClick={()=>requestMoney("withdraw")}>{busy?"Enviando...":"Solicitar saque"} <ArrowUpRight size={17}/></button><small>Solicitações de saque ficam pendentes. Não há transferência automática neste protótipo.</small></div></div><RequestsCard requests={allRequests}/></section>}
         {page==="activity" && <section><div className="page-heading"><div><span className="eyebrow">HISTÓRICO DA CONTA</span><h1>Atividade</h1><p>Acompanhe as solicitações registradas nesta conta.</p></div><button className="btn light" onClick={()=>window.location.reload()}><RefreshCw size={16}/> Atualizar</button></div><RequestsCard requests={allRequests} full/></section>}
-        {page==="help" && <section><div className="page-heading"><div><span className="eyebrow">CENTRO DE SUPORTE</span><h1>Como podemos ajudar?</h1><p>Encontre orientação sobre sua conta e solicitações.</p></div></div><div className="help-grid"><HelpCard icon={Wallet} title="Depósitos" text="Crie uma solicitação na carteira. A equipe precisa confirmar o pagamento antes de qualquer atualização do saldo."/><HelpCard icon={ArrowUpRight} title="Saques" text="Envie o valor e o destino. O pedido ficará pendente até revisão e pagamento por um operador autorizado."/><HelpCard icon={Pickaxe} title="Mineração demo" text="Os indicadores de mineração são simulados localmente e não são lucros reais nem ativos sacáveis."/><HelpCard icon={ShieldCheck} title="Segurança" text="Nunca envie sua senha ou códigos de autenticação por e-mail. Use apenas canais oficiais verificados."/><a className="support-large" href={`mailto:${SUPPORT}?subject=Suporte%20BrasilNova%20Trading`}><div className="mini-icon green"><Bell size={19}/></div><div><h3>Contactar suporte</h3><p>{SUPPORT}</p></div><span>↗</span></a></div></section>}
+        {page === "admin" && <AdminPanel />}
+      {page==="help" && <section><div className="page-heading"><div><span className="eyebrow">CENTRO DE SUPORTE</span><h1>Como podemos ajudar?</h1><p>Encontre orientação sobre sua conta e solicitações.</p></div></div><div className="help-grid"><HelpCard icon={Wallet} title="Depósitos" text="Crie uma solicitação na carteira. A equipe precisa confirmar o pagamento antes de qualquer atualização do saldo."/><HelpCard icon={ArrowUpRight} title="Saques" text="Envie o valor e o destino. O pedido ficará pendente até revisão e pagamento por um operador autorizado."/><HelpCard icon={Pickaxe} title="Ative o minerador para começar a ganhar" text="Os indicadores de mineração são simulados localmente e não são lucros reais nem ativos sacáveis."/><HelpCard icon={ShieldCheck} title="Segurança" text="Nunca envie sua senha ou códigos de autenticação por e-mail. Use apenas canais oficiais verificados."/><a className="support-large" href={`mailto:${SUPPORT}?subject=Suporte%20BrasilNova%20Trading`}><div className="mini-icon green"><Bell size={19}/></div><div><h3>Contactar suporte</h3><p>{SUPPORT}</p></div><span>↗</span></a></div></section>}
       </div>
-      <footer className="footer"><span>© {new Date().getFullYear()} BrasilNova Trading</span><span><ShieldCheck size={13}/> Protótipo — revise integrações antes de operar com dinheiro real.</span></footer>
+      <footer className="footer"><span>© {new Date().getFullYear()} BrasilNova Trading</span><span><ShieldCheck size={13}/> Protótipo </span></footer>
     </main>
   </div>;
 }
@@ -339,7 +357,7 @@ function Dashboard({profile,balance,setPage,requests,setMining,mining}) {
   const pending = requests.filter(x=>x.status==="pending").length;
   return <section><div className="welcome-row"><div><span className="eyebrow">SEU PAINEL FINANCEIRO</span><h1>Olá, {(profile?.fullName||"investidor").split(" ")[0]} <span className="wave">✦</span></h1><p>Veja o resumo da sua conta e continue de onde parou.</p></div><div className="date-chip"><Clock3 size={15}/>{new Intl.DateTimeFormat("pt-BR",{dateStyle:"long"}).format(new Date())}</div></div>
     <div className="overview-card"><div className="overview-main"><span className="subtle"><span className="green-dot"/> SALDO DA CONTA</span><h2>{money(balance)}</h2><p>Valor registrado no seu perfil</p><div className="overview-actions"><button className="btn white" onClick={()=>setPage("wallet")}><ArrowDownLeft size={17}/> Depositar</button><button className="btn glass" onClick={()=>setPage("wallet")}><ArrowUpRight size={17}/> Sacar</button></div></div><div className="overview-decoration"><div className="chart-lines"><span/><span/><span/><span/><span/><span/><span/></div><div className="chart-glow"/></div><div className="overview-corner"><Bitcoin size={62}/></div></div>
-    <div className="stat-grid"><Stat icon={Wallet} label="Saldo registrado" value={money(balance)} change="Perfil Firestore"/><Stat icon={Clock3} label="Pedidos pendentes" value={String(pending)} change="Aguardando revisão"/><Stat icon={Pickaxe} label="Mineração" value={mining?"Ativa":"Consulte sessão"} change="Sessão de 24 horas"/><Stat icon={BarChart3} label="Solicitações totais" value={String(requests.length)} change="Depósitos + saques"/></div>
+    <div className="stat-grid"><Stat icon={Wallet} label="Saldo registrado" value={money(balance)} change="saldo da conta"/><Stat icon={Clock3} label="Pedidos pendentes" value={String(pending)} change="Aguardando revisão"/><Stat icon={Pickaxe} label="Mineração" value={mining?"Ativa":"Consulte sessão"} change="Sessão de 24 horas"/><Stat icon={BarChart3} label="Solicitações totais" value={String(requests.length)} change="Depósitos + saques"/></div>
     <div className="section-row"><div><h3>Acesso rápido</h3><p>Atalhos para as principais funções.</p></div></div><div className="quick-grid"><Quick icon={ArrowDownLeft} title="Adicionar fundos" text="Solicitar um depósito" onClick={()=>setPage("wallet")}/><Quick icon={ArrowUpRight} title="Retirar fundos" text="Enviar um pedido de saque" onClick={()=>setPage("wallet")}/><Quick icon={Pickaxe} title="Centro de mineração" text="Abrir centro de mineração" onClick={()=>setPage("mining")}/></div>
     <div className="section-row"><div><h3>Atividade recente</h3><p>Últimas solicitações da conta.</p></div><button className="text-btn" onClick={()=>setPage("activity")}>Ver histórico ↗</button></div><RequestsCard requests={requests.slice(0,4)}/>
   </section>;
